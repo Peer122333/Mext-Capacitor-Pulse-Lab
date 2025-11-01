@@ -339,67 +339,116 @@ def acquire_n_pulses(n_pulses: int = N_PULSES,
             ct.byref(bufB), 
             N_SAMPLES, 
             0,
-            ps.PS3000A_RATIO_MODE["PS3000A_RATIO_MODE_NONE"]))
+            ps.PS3000A_RATIO_MODE["PS3000A_RATIO_MODE_NONE"]
+            )
+        )
 
-        pre  = int(PRETRIG_RATIO * N_SAMPLES)
-        post = N_SAMPLES - pre
+        # --------------------------------------------------------
+        # 7) Zeitachse und Pre/Posttrigger berechnen
+        # --------------------------------------------------------
+        pre_samples  = int(PRETRIG_RATIO * N_SAMPLES)
+        post_samples = N_SAMPLES - pre_samples
+        #Zeitvektor in Sekunden (für Auswertung)
         t = np.arange(N_SAMPLES) * dt
 
-        # Header & Meta einmalig schreiben
+        # --------------------------------------------------------  
+        # 8) CSV-Header + Meta-Datei genau einmal schreiben
+        # --------------------------------------------------------
         i_unit = "A" if (ROGOWSKI_V_PER_A and ROGOWSKI_V_PER_A > 0) else "V"
         _csv_exists_write_header(i_unit)
         write_meta_once(dict(
-            run_name=RUN_NAME, fs=fs, dt_s=dt,
-            pretrigger_samples=pre, posttrigger_samples=post,
+            run_name=RUN_NAME, 
+            fs=fs, 
+            dt_s=dt,
+            pretrigger_samples=pre_samples, 
+            posttrigger_samples=post_samples,
             ch_a=dict(coupling="AC", v_range=vfs_a),
-            ch_b=dict(coupling="AC", v_range=vfs_b, rogowski_v_per_a=ROGOWSKI_V_PER_A),
+            ch_b=dict(coupling="AC", 
+                      v_range=vfs_b, 
+                      rogowski_v_per_a=ROGOWSKI_V_PER_A
+            ),
             trigger_level_v=TRIG_LEVEL_V,
         ))
 
-        # Start-pulse_id nur einmal ermitteln
+        # Start-pulse_id ermitteln, damit nicht doppelt geschrieben wird
         pulse_id = _next_pulse_id_scan()
 
+        # (Optional) Wartezeit, falls deine Hardware erst noch "Puls laden" muss
+        # time.sleep(10)
 
-        time.sleep(10)
-        # Schleife über Pulse
+        # --------------------------------------------------------
+        # 9) Messschleife über n_pulses
+        # --------------------------------------------------------
         for k in range(n_pulses):
+            # 9.1 Messungen starten
             time_indisposed_ms = ct.c_int32(0)
-            assert_pico_ok(ps.ps3000aRunBlock(
-                handle, pre, post, timebase, int(OVERSAMPLE),
-                ct.byref(time_indisposed_ms), 0, None, None))
+            assert_pico_ok(
+                ps.ps3000aRunBlock(
+                    handle, 
+                    pre_samples, 
+                    post_samples, 
+                    timebase, 
+                    int(OVERSAMPLE),
+                    ct.byref(time_indisposed_ms), 
+                    0, 
+                    None, 
+                    None
+                )
+            )
 
-            # Warten bis fertig
+            # 9.2 Warten bis Erfassung wirklich fertig ist
             ready = ct.c_int16(0)
             while not ready.value:
                 ps.ps3000aIsReady(handle, ct.byref(ready))
-                time.sleep(0.001)
+                time.sleep(0.001) # 1ms Polling-Intervall
 
-            # Werte holen
+            # 9.3 Werte aus dem Gerät holen
             n = ct.c_int32(N_SAMPLES)
             overflow = ct.c_int16()
-            assert_pico_ok(ps.ps3000aGetValues(
-                handle, 0, ct.byref(n), 1,
-                ps.PS3000A_RATIO_MODE["PS3000A_RATIO_MODE_NONE"],
-                0, ct.byref(overflow)))
+            assert_pico_ok(
+                ps.ps3000aGetValues(
+                    handle, 
+                    0, 
+                    ct.byref(n), 
+                    1,
+                    ps.PS3000A_RATIO_MODE["PS3000A_RATIO_MODE_NONE"],
+                    0, 
+                    ct.byref(overflow)
+                )
+            )
 
-            # Umrechnen
+            # 9.4 Raw -> numpy
             adcA = np.frombuffer(bufA, dtype=np.int16, count=n.value).astype(np.float64, copy=False)
             adcB = np.frombuffer(bufB, dtype=np.int16, count=n.value).astype(np.float64, copy=False)
             
-            
+            # 9.5 ADC -> echte Spannung
+            #   adc_wert / max_adc → relativer Anteil
+            #   * vfs_a → Volt am Pico
+            #   * U_PROBE_ATTENUATION → zurückrechnen auf DUT
             u = adcA * (vfs_a / max_adc.value) * U_PROBE_ATTENUATION
+
+            # 9.6 ADC → Strompfad (erst Volt)
             i_v = adcB * (vfs_b / max_adc.value)
-            i = i_v / ROGOWSKI_V_PER_A
+            i = i_v / ROGOWSKI_V_PER_A # Volt -> Ampere mit passendem Faktor
 
-            print(f'Spannung U (CH A): min={u.min():.3f} V  max={u.max():.3f} V')
-            print(f'Strom I (CH B): min={i.min():.3f} {i_unit}  max={i.max():.3f} {i_unit}')
-            print(f"{k}")
+            # 9.8 etwas Debug ausgeben
+            print(
+                f"[pico] pulse {k+1}/{n_pulses}: "
+                f"U=[{u.min():.3f}, {u.max():.3f}] V "
+                f"I=[{i.min():.3f}, {i.max():.3f}] {i_unit}"
+            )
 
-            # An CSV anhängen (mit fixer pulse_id)
+            # 9.9 in CSV schreiben (eine Zeile pro Sample)
             append_csv_with_id(t, u, i, i_unit, pulse_id)
-            print(f"[OK] pulse_id={pulse_id}  rows={n.value}  overflow={overflow.value}  timeIndisposed={time_indisposed_ms.value} ms")
+            print(
+                f"[pico] -> written pulse_id={pulse_id}  "
+                f"samples={n.value}  overflow={overflow.value}  "
+                f"timeIndisposed={time_indisposed_ms.value} ms"
+            )
 
             pulse_id += 1  # nächster Puls
+            
+            # 9.10 optionale Pause zwischen Messungen
             if inter_pulse_delay_s > 0:
                 time.sleep(inter_pulse_delay_s)
 
@@ -407,11 +456,15 @@ def acquire_n_pulses(n_pulses: int = N_PULSES,
             # Falls nötig: ps.ps3000aStop(handle)
 
     finally:
+        # --------------------------------------------------------
+        # 10) Aufräumen – Gerät immer schließen!
+        # --------------------------------------------------------
         try:
             ps.ps3000aStop(handle)
         except Exception:
             pass
         ps.ps3000aCloseUnit(handle)
+        print("[pico] device closed")
 
 # --------- Start ---------
 if __name__ == "__main__":
