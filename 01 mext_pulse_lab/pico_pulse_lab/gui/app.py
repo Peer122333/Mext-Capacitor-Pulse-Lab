@@ -11,7 +11,7 @@ try:
 except Exception:
     list_ports = None # fallback
 
-from nucleo_uart import NucleoUART # Import der NucleoUART-Klasse
+from pico_pulse_lab.control.stm32_uart import NucleoUART # Import der NucleoUART-Klasse
 
 class App:
     def __init__(self, root):

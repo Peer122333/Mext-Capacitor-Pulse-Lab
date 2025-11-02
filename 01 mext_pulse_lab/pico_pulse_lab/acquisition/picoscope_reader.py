@@ -15,6 +15,14 @@ from datetime import datetime
 from picosdk.ps3000a import ps3000a as ps    # Picoscope PS3000A SDK 
 from picosdk.functions import assert_pico_ok # Fehlerprüfung SDK-Aufrufe
 
+from pico_pulse_lab.storage.csv_writer import (
+    ensure_csv,
+    scan_next_pulse_id,
+    append_pulse_to_csv,
+    write_meta,
+)
+
+
 # ============================================================
 # 1) KONFIGURATION
 # ============================================================
@@ -160,73 +168,6 @@ def pick_timebase(handle, target_fs: float, n_samples: int):
     _, tb, dt, fs = best
     return tb, dt, fs
 
-# ---------- CSV-Helfer ----------
-def _csv_header(i_unit: str) -> str:
-    """Schreibt den CSV Header bei einer neuen Messreihe EINMALIG in die ersten Zeilen.
-    """
-    return (
-        f"# RUN_NAME={RUN_NAME}\n"
-        f"# created={datetime.now().isoformat()}\n"
-        f"# columns: pulse_id,sample_idx,time_s,u_V,i_{i_unit}\n"
-    )
-
-
-def _ensure_csv(i_unit: str) -> None:
-    """legt CSV an, falls sie noch nicht existiert."""
-    if not os.path.exists(CSV_PATH):
-        with open(CSV_PATH, "w", encoding="utf-8") as f:
-            f.write(_csv_header(i_unit))
-
-def _csv_exists_write_header(i_unit):
-    if not os.path.exists(CSV_PATH):
-        with open(CSV_PATH, "w", encoding="utf-8") as f:
-            f.write(_csv_header(i_unit))
-
-def _next_pulse_id_scan() -> int:
-    """Liest die höchste pulse_id aus der CSV (nur einmal zu Beginn nötig)."""
-    if not os.path.exists(CSV_PATH):
-        return 1
-    last_id = 0
-    with open(CSV_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line or line[0] == "#":
-                continue
-            try:
-                pid = int(line.split(",")[0])
-                if pid > last_id:
-                    last_id = pid
-            except Exception:
-                pass
-    return last_id + 1
-
-def append_csv_with_id(t: np.ndarray, 
-                       u: np.ndarray, 
-                       i: np.ndarray, 
-                       i_unit: str, 
-                       pulse_id: int) -> None:
-    """Hängt einen Puls mit gegebener pulse_id an die CSV an (ohne erneuten Scan)."""
-    _csv_exists_write_header(i_unit)
-    n = len(t)
-    data = np.column_stack([
-        np.full(n, pulse_id, dtype=np.int64),
-        np.arange(n, dtype=np.int64),
-        t.astype(np.float64, copy=False),
-        u.astype(np.float64, copy=False),
-        i.astype(np.float64, copy=False),
-    ])
-    with open(CSV_PATH, "a", encoding="utf-8") as f:
-        np.savetxt(f, data, delimiter=",",
-                   fmt=["%d", "%d", "%.9e", "%.9e", "%.9e"])
-
-def write_meta_once(meta):
-    """Schreibt/aktualisiert eine Meta-JSON zum Run (Sampling, Bereiche etc.)."""
-    meta_out = dict(meta)
-    meta_out["run_name"] = RUN_NAME
-    meta_out["csv_path"] = CSV_PATH
-    meta_out["created_or_updated"] = datetime.now().isoformat()
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta_out, f, indent=2)
-
 
 # ============================================================
 # 3) HAUPTFUNKTION
@@ -355,8 +296,8 @@ def acquire_n_pulses(n_pulses: int = N_PULSES,
         # 8) CSV-Header + Meta-Datei genau einmal schreiben
         # --------------------------------------------------------
         i_unit = "A" if (ROGOWSKI_V_PER_A and ROGOWSKI_V_PER_A > 0) else "V"
-        _csv_exists_write_header(i_unit)
-        write_meta_once(dict(
+        ensure_csv(CSV_PATH, RUN_NAME, i_unit)
+        write_meta(dict(
             run_name=RUN_NAME, 
             fs=fs, 
             dt_s=dt,
@@ -371,7 +312,7 @@ def acquire_n_pulses(n_pulses: int = N_PULSES,
         ))
 
         # Start-pulse_id ermitteln, damit nicht doppelt geschrieben wird
-        pulse_id = _next_pulse_id_scan()
+        pulse_id = scan_next_pulse_id(CSV_PATH)
 
         # (Optional) Wartezeit, falls deine Hardware erst noch "Puls laden" muss
         # time.sleep(10)
@@ -439,7 +380,7 @@ def acquire_n_pulses(n_pulses: int = N_PULSES,
             )
 
             # 9.9 in CSV schreiben (eine Zeile pro Sample)
-            append_csv_with_id(t, u, i, i_unit, pulse_id)
+            append_pulse_to_csv(t, u, i, i_unit, pulse_id)
             print(
                 f"[pico] -> written pulse_id={pulse_id}  "
                 f"samples={n.value}  overflow={overflow.value}  "
