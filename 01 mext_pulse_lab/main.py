@@ -52,10 +52,12 @@ def example_with_temp_logger():
 
 if __name__ == "__main__":
     # Option 1: Test-Funktion
-    test_temp_logger()
+    # test_temp_logger()
     
     # Option 2: Beispiel mit Puls-Messung
     # example_with_temp_logger()
     
     # Option 3: Normale Puls-Messung (aus picoscope_reader.py)
     # acquire_n_pulses(n_pulses=3)
+
+    
