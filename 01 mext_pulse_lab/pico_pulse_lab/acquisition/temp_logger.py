@@ -9,23 +9,18 @@ import threading
 import time
 from typing import Optional
 
-
-# USB TC-08 SDK (basierend auf Pico Technology API)
-# Diese Werte müssen je nach installierter SDK-Version angepasst werden
+# USB TC-08 SDK (Pico Technology Python SDK)
 try:
-    # Versuche, die DLL/SO zu laden (Pfad je nach System unterschiedlich)
-    import platform
-    system = platform.system()
-    if system == "Windows":
-        tc08_dll = ct.CDLL("usbtc08.dll")
-    elif system == "Darwin":  # macOS
-        tc08_dll = ct.CDLL("libusbtc08.dylib")
-    else:  # Linux
-        tc08_dll = ct.CDLL("libusbtc08.so")
-except OSError:
-    # Fallback: Wenn DLL nicht gefunden wird, verwende Mock für Tests
-    tc08_dll = None
-    print("[Warnung] USB TC-08 DLL nicht gefunden. Verwende Mock-Modus für Tests.")
+    from picosdk.usbtc08 import usbtc08 as tc08
+    from picosdk.functions import assert_pico2000_ok
+    TC08_SDK_AVAILABLE = True
+except (ImportError, OSError) as e:
+    # SDK nicht verfügbar (z.B. nicht installiert oder DLL nicht gefunden)
+    print(f"[Warnung] USB TC-08 SDK nicht verfügbar: {e}")
+    print("[Warnung] Temperaturlogger wird im Mock-Modus laufen")
+    tc08 = None
+    assert_pico2000_ok = lambda x: None  # Dummy-Funktion
+    TC08_SDK_AVAILABLE = False
 
 
 class TempLogger:
@@ -66,35 +61,35 @@ class TempLogger:
         Returns:
             True wenn erfolgreich, False sonst
         """
-        if tc08_dll is None:
-            print("[TempLogger] Mock-Modus: Gerät nicht verfügbar")
+        if not TC08_SDK_AVAILABLE:
+            print("[TempLogger] Mock-Modus: SDK nicht verfügbar")
             return False
             
         try:
-            # usb_tc08_open_unit gibt einen Handle zurück
-            # Typ je nach SDK-Version: int16 oder int32
-            handle_ptr = ct.byref(ct.c_int16())
-            status = tc08_dll.usb_tc08_open_unit(handle_ptr)
+            # usb_tc08_open_unit gibt direkt einen Handle zurück (int16)
+            status = tc08.usb_tc08_open_unit()
+            assert_pico2000_ok(status)
+            self.handle = status
+            print(f"[TempLogger] Gerät geöffnet, Handle: {self.handle}")
             
-            if status == 0:  # 0 = OK
-                self.handle = handle_ptr.contents.value
-                print(f"[TempLogger] Gerät geöffnet, Handle: {self.handle}")
-                return True
-            else:
-                print(f"[TempLogger] Fehler beim Öffnen: Status {status}")
-                return False
+            # Setze Mains-Rejection auf 50 Hz (0 = 50 Hz, 1 = 60 Hz)
+            status_mains = tc08.usb_tc08_set_mains(self.handle, 0)
+            assert_pico2000_ok(status_mains)
+            
+            return True
         except Exception as e:
-            print(f"[TempLogger] Fehler: {e}")
+            print(f"[TempLogger] Fehler beim Öffnen: {e}")
             return False
     
     def close(self) -> None:
         """Schließt die Verbindung zum Gerät."""
-        if self.handle is not None and tc08_dll is not None:
+        if self.handle is not None and TC08_SDK_AVAILABLE:
             try:
-                tc08_dll.usb_tc08_close_unit(ct.c_int16(self.handle))
+                status = tc08.usb_tc08_close_unit(self.handle)
+                assert_pico2000_ok(status)
                 print("[TempLogger] Gerät geschlossen")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[TempLogger] Fehler beim Schließen: {e}")
             self.handle = None
     
     def start(self) -> bool:
@@ -248,70 +243,73 @@ class TempLogger:
     
     def _measurement_loop(self) -> None:
         """Hintergrund-Thread: Liest kontinuierlich Temperaturwerte."""
-        if tc08_dll is None:
+        if not TC08_SDK_AVAILABLE:
             # Mock-Modus für Tests
             self._mock_measurement_loop()
             return
             
-        # Konfiguriere Kanal 1 (einfachste Variante)
+        # Konfiguriere Kanal 1 mit Thermoelement-Typ K
         try:
-            # usb_tc08_set_channel(handle, channel, type)
-            # type: 0='J', 1='K', 2='T', 3='E', 4='R', 5='S', 6='B', 7='N'
-            # Verwende Typ 'K' (Chromel-Alumel)
-            tc08_dll.usb_tc08_set_channel.argtypes = [ct.c_int16, ct.c_int8, ct.c_int8]
-            tc08_dll.usb_tc08_set_channel(self.handle, ct.c_int8(1), ct.c_int8(1))  # Kanal 1, Typ K
+            # Thermoelement-Typen: B=66, E=69, J=74, K=75, N=78, R=82, S=83, T=84, ' '=32, X=88
+            typeK = ct.c_int8(75)
+            status_set = tc08.usb_tc08_set_channel(self.handle, 1, typeK)
+            assert_pico2000_ok(status_set)
             
-            # Starte Messung
-            tc08_dll.usb_tc08_run.argtypes = [ct.c_int16, ct.c_int32]
-            tc08_dll.usb_tc08_run(self.handle, ct.c_int32(int(self.update_interval_s * 1000)))
+            # Hole Minimum-Intervall (in ms)
+            min_interval_ms = tc08.usb_tc08_get_minimum_interval_ms(self.handle)
+            assert_pico2000_ok(min_interval_ms)
+            min_interval_s = min_interval_ms / 1000.0
+            
+            # Stelle sicher, dass update_interval_s >= min_interval_s
+            if self.update_interval_s < min_interval_s:
+                print(f"[TempLogger] Update-Intervall zu klein ({self.update_interval_s}s), "
+                      f"verwende Minimum: {min_interval_s}s")
+                self.update_interval_s = min_interval_s
+                
         except Exception as e:
             print(f"[TempLogger] Fehler bei Konfiguration: {e}")
             return
         
+        # Einheiten: Celsius
+        units = tc08.USBTC08_UNITS["USBTC08_UNITS_CENTIGRADE"]
+        
         while self.is_running:
             try:
-                # usb_tc08_get_temp gibt Temperatur zurück
-                tc08_dll.usb_tc08_get_temp.argtypes = [
-                    ct.c_int16,  # handle
-                    ct.POINTER(ct.c_float),  # temp
-                    ct.POINTER(ct.c_int16),  # overflow
-                    ct.c_int8  # channel
-                ]
-                tc08_dll.usb_tc08_get_temp.restype = ct.c_int16
+                # usb_tc08_get_single liest eine Einzelmessung
+                # temp ist ein Array von 9 floats: [Cold Junction, Channel 1-8]
+                temp = (ct.c_float * 9)()
+                overflow = ct.c_int16(0)
                 
-                temp_ptr = ct.byref(ct.c_float())
-                overflow_ptr = ct.byref(ct.c_int16())
-                status = tc08_dll.usb_tc08_get_temp(
+                status_get = tc08.usb_tc08_get_single(
                     self.handle,
-                    temp_ptr,
-                    overflow_ptr,
-                    ct.c_int8(1)  # Kanal 1
+                    ct.byref(temp),
+                    ct.byref(overflow),
+                    units
                 )
+                assert_pico2000_ok(status_get)
                 
-                if status == 0:  # OK
-                    temp = temp_ptr.contents.value
-                    timestamp = time.time()
+                # Kanal 1 ist temp[1] (temp[0] ist Cold Junction)
+                temp_celsius = temp[1]
+                timestamp = time.time()
+                
+                with self._lock:
+                    # Aktuellen Wert speichern
+                    self._temp_values[1] = (temp_celsius, timestamp)
                     
-                    with self._lock:
-                        # Aktuellen Wert speichern
-                        self._temp_values[1] = (temp, timestamp)
+                    # Historie aktualisieren
+                    self._temp_history.append((timestamp, {1: temp_celsius}))
+                    
+                    # Historie begrenzen (älteste Einträge entfernen)
+                    if len(self._temp_history) > self._max_history:
+                        self._temp_history = self._temp_history[-self._max_history:]
+                
+                # Callback aufrufen (außerhalb des Locks für Thread-Safety)
+                if self.on_update_callback:
+                    try:
+                        self.on_update_callback(1, temp_celsius, timestamp)
+                    except Exception as e:
+                        print(f"[TempLogger] Callback-Fehler: {e}")
                         
-                        # Historie aktualisieren
-                        self._temp_history.append((timestamp, {1: temp}))
-                        
-                        # Historie begrenzen (älteste Einträge entfernen)
-                        if len(self._temp_history) > self._max_history:
-                            self._temp_history = self._temp_history[-self._max_history:]
-                    
-                    # Callback aufrufen (außerhalb des Locks für Thread-Safety)
-                    if self.on_update_callback:
-                        try:
-                            self.on_update_callback(1, temp, timestamp)
-                        except Exception as e:
-                            print(f"[TempLogger] Callback-Fehler: {e}")
-                else:
-                    print(f"[TempLogger] Fehler beim Lesen: Status {status}")
-                    
             except Exception as e:
                 print(f"[TempLogger] Fehler in Messschleife: {e}")
             

@@ -50,6 +50,9 @@ def example_with_temp_logger():
     print("=== Beispiel beendet ===\n")
 
 
+
+
+
 if __name__ == "__main__":
     # Option 1: Test-Funktion
     test_temp_logger()
